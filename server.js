@@ -1,5 +1,5 @@
 // ===============================================================================
-// APEX UNIFIED MASTER v12.5.0 (QUICKNODE BUNDLER + MULTI-STRAT API)
+// APEX UNIFIED MASTER v12.5.1 (MULTI-RPC FAILOVER + ANTI-CRASH)
 // ===============================================================================
 
 require('dotenv').config();
@@ -11,13 +11,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// 1. CONFIGURATION
+// 1. CONFIGURATION & FAILOVER POOL
 const PORT = process.env.PORT || 8080;
 const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0";
-const PAYOUT_WALLET = process.env.PAYOUT_WALLET;
 
-// Specialized Tokens (Base "Long Tail" targets)
+// Public RPCs act as a safety net so the bot NEVER defaults to 127.0.0.1
+const RPC_POOL = [
+    process.env.QUICKNODE_HTTP,      
+    "https://mainnet.base.org",      
+    "https://base.llamarpc.com",     
+    "https://base.drpc.org"          
+].filter(url => url && url.startsWith('http'));
+
+const WSS_URL = process.env.QUICKNODE_WSS || "wss://base-rpc.publicnode.com";
+
 const TOKENS = {
     WETH: "0x4200000000000000000000000000000000000006",
     DEGEN: "0x4edbc9ba171790664872997239bc7a3f3a633190",
@@ -34,43 +42,56 @@ let provider, signer, flashContract, transactionNonce;
 let totalEarnings = 0;
 let lastLogTime = Date.now();
 
-// 2. HARDENED BOOT
+// 2. HARDENED BOOT (With Fallback Logic)
 async function init() {
+    console.log("🛡️ BOOTING APEX SURVIVAL ENGINE...");
     const baseNetwork = ethers.Network.from(8453);
-    provider = new ethers.JsonRpcProvider(process.env.QUICKNODE_HTTP, baseNetwork, { staticNetwork: baseNetwork });
+
+    // Map all pool URLs into Fallback configurations
+    const configs = RPC_POOL.map((url, i) => ({
+        provider: new ethers.JsonRpcProvider(url, baseNetwork, { staticNetwork: baseNetwork }),
+        priority: i === 0 ? 1 : 2, // Prefer your QuickNode first
+        stallTimeout: 2500
+    }));
+
+    // The FallbackProvider prevents the "ECONNREFUSED" crash
+    provider = new ethers.FallbackProvider(configs);
+    
     signer = new ethers.Wallet(PRIVATE_KEY, provider);
     flashContract = new ethers.Contract(CONTRACT_ADDR, ABI, signer);
     
-    transactionNonce = await provider.getTransactionCount(signer.address, 'latest');
-    console.log(`[BOOT] Apex Engine Live. Nonce: ${transactionNonce} | Target: Long-Tail`);
+    try {
+        transactionNonce = await provider.getTransactionCount(signer.address, 'latest');
+        console.log(`✅ [BOOT] Online. Nonce: ${transactionNonce} | RPCs Active: ${RPC_POOL.length}`);
+    } catch (e) {
+        console.error("❌ [CRITICAL] All RPCs failed to respond.");
+        process.exit(1);
+    }
 }
 
-// 3. APEX EXECUTION (The "First" Logic)
+// 3. APEX EXECUTION
 async function executeApexStrike(targetTx) {
     try {
         if (!targetTx || !targetTx.to) return;
         
-        // Filter for significant DEX swaps (>0.05 ETH)
         if (targetTx.value > ethers.parseEther("0.05")) {
             lastLogTime = Date.now();
-            console.log(`[🎯 TARGET] Whale: ${ethers.formatEther(targetTx.value)} ETH. Simulating...`);
+            console.log(`[🎯 TARGET] Whale: ${ethers.formatEther(targetTx.value)} ETH.`);
 
             // --- SIMULATION (Free Shield) ---
             try {
                 await flashContract.executeFlashArbitrage.staticCall(TOKENS.WETH, TOKENS.DEGEN, ethers.parseEther("100"));
-            } catch (err) { return; } // Failed sim = No profit. Skip.
+            } catch (err) { return; } 
 
             // --- AGGRESSIVE BUNDLE ---
             const feeData = await provider.getFeeData();
-            const aggressiveBribe = (feeData.maxPriorityFeePerGas * 2n);
-
             const strike = await flashContract.executeFlashArbitrage(
                 TOKENS.WETH,
                 TOKENS.DEGEN,
                 ethers.parseEther("100"), 
                 {
                     gasLimit: 850000,
-                    maxPriorityFeePerGas: aggressiveBribe, // Jump the queue
+                    maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas * 2n), 
                     maxFeePerGas: feeData.maxFeePerGas,
                     nonce: transactionNonce++,
                     type: 2
@@ -80,7 +101,7 @@ async function executeApexStrike(targetTx) {
             console.log(`[🚀 STRIKE SENT] Tx: ${strike.hash}`);
             const receipt = await strike.wait(1);
             if (receipt.status === 1) {
-                totalEarnings += 12.50; // Estimated profit logging
+                totalEarnings += 12.50; 
                 console.log(`[💰 SUCCESS] Profit Captured!`);
             }
         }
@@ -89,13 +110,22 @@ async function executeApexStrike(targetTx) {
     }
 }
 
-// 4. THE DARK FOREST SCANNER (WSS)
+// 4. THE DARK FOREST SCANNER (WSS with Reconnect)
 function startScanning() {
-    const wssProvider = new ethers.WebSocketProvider(process.env.QUICKNODE_WSS);
+    console.log(`🔍 MEMPOOL SCANNER LIVE: ${WSS_URL.substring(0, 30)}...`);
+    const wssProvider = new ethers.WebSocketProvider(WSS_URL);
     
     wssProvider.on("pending", async (txHash) => {
-        const tx = await provider.getTransaction(txHash);
-        if (tx) executeApexStrike(tx);
+        try {
+            const tx = await provider.getTransaction(txHash);
+            if (tx) executeApexStrike(tx);
+        } catch (e) { /* FallbackProvider handles retries */ }
+    });
+
+    // Auto-reconnect on WSS failure
+    wssProvider.websocket.on("close", () => {
+        console.log("🔄 WSS Drop. Reconnecting...");
+        setTimeout(startScanning, 5000);
     });
 
     setInterval(() => {
@@ -104,7 +134,7 @@ function startScanning() {
     }, 60000);
 }
 
-// 5. API ENDPOINTS (Unified Management)
+// 5. API ENDPOINTS
 app.get('/status', async (req, res) => {
     try {
         const bal = await provider.getBalance(signer.address);
@@ -113,7 +143,7 @@ app.get('/status', async (req, res) => {
             status: "HUNTING",
             wallet_eth: ethers.formatEther(bal),
             contract_weth: ethers.formatEther(contractBal),
-            estimated_earnings_usd: totalEarnings
+            rpcs_online: RPC_POOL.length
         });
     } catch (e) { res.json({ status: "ERROR" }); }
 });
@@ -129,7 +159,7 @@ app.post('/withdraw', async (req, res) => {
 // 6. START
 init().then(() => {
     app.listen(PORT, () => {
-        console.log(`[SYSTEM] v12.5.0 API listening on ${PORT}`);
+        console.log(`[SYSTEM] v12.5.1 API listening on ${PORT}`);
         startScanning();
     });
 });
