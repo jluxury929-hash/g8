@@ -1,5 +1,5 @@
 // ===============================================================================
-// APEX UNIFIED MASTER v12.5.1 (MULTI-RPC FAILOVER + ANTI-CRASH)
+// APEX UNIFIED MASTER v12.5.3 (FAILOVER + WSS STABILIZED + PENDING NONCE)
 // ===============================================================================
 
 require('dotenv').config();
@@ -16,7 +16,6 @@ const PORT = process.env.PORT || 8080;
 const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0";
 
-// Public RPCs act as a safety net so the bot NEVER defaults to 127.0.0.1
 const RPC_POOL = [
     process.env.QUICKNODE_HTTP,      
     "https://mainnet.base.org",      
@@ -39,29 +38,26 @@ const ABI = [
 ];
 
 let provider, signer, flashContract, transactionNonce;
-let totalEarnings = 0;
 let lastLogTime = Date.now();
 
-// 2. HARDENED BOOT (With Fallback Logic)
+// 2. HARDENED BOOT (With Fallback + Pending Nonce)
 async function init() {
     console.log("🛡️ BOOTING APEX SURVIVAL ENGINE...");
     const baseNetwork = ethers.Network.from(8453);
 
-    // Map all pool URLs into Fallback configurations
     const configs = RPC_POOL.map((url, i) => ({
         provider: new ethers.JsonRpcProvider(url, baseNetwork, { staticNetwork: baseNetwork }),
-        priority: i === 0 ? 1 : 2, // Prefer your QuickNode first
+        priority: i === 0 ? 1 : 2, 
         stallTimeout: 2500
     }));
 
-    // The FallbackProvider prevents the "ECONNREFUSED" crash
     provider = new ethers.FallbackProvider(configs);
-    
     signer = new ethers.Wallet(PRIVATE_KEY, provider);
     flashContract = new ethers.Contract(CONTRACT_ADDR, ABI, signer);
     
     try {
-        transactionNonce = await provider.getTransactionCount(signer.address, 'latest');
+        // FIX: Use 'pending' tag to include transactions currently in mempool
+        transactionNonce = await provider.getTransactionCount(signer.address, 'pending');
         console.log(`✅ [BOOT] Online. Nonce: ${transactionNonce} | RPCs Active: ${RPC_POOL.length}`);
     } catch (e) {
         console.error("❌ [CRITICAL] All RPCs failed to respond.");
@@ -69,65 +65,76 @@ async function init() {
     }
 }
 
-// 3. APEX EXECUTION
+// 3. APEX EXECUTION (With Gas Guard & Aggressive Bidding)
 async function executeApexStrike(targetTx) {
     try {
-        if (!targetTx || !targetTx.to) return;
+        if (!targetTx || !targetTx.to || targetTx.value < ethers.parseEther("0.05")) return;
         
-        if (targetTx.value > ethers.parseEther("0.05")) {
-            lastLogTime = Date.now();
-            console.log(`[🎯 TARGET] Whale: ${ethers.formatEther(targetTx.value)} ETH.`);
+        // GAS GUARD: Don't attempt if wallet is too low to pay gas
+        const balance = await provider.getBalance(signer.address);
+        if (balance < ethers.parseEther("0.0015")) return; 
 
-            // --- SIMULATION (Free Shield) ---
-            try {
-                await flashContract.executeFlashArbitrage.staticCall(TOKENS.WETH, TOKENS.DEGEN, ethers.parseEther("100"));
-            } catch (err) { return; } 
+        lastLogTime = Date.now();
+        console.log(`[🎯 TARGET] Whale: ${ethers.formatEther(targetTx.value)} ETH.`);
 
-            // --- AGGRESSIVE BUNDLE ---
-            const feeData = await provider.getFeeData();
-            const strike = await flashContract.executeFlashArbitrage(
-                TOKENS.WETH,
-                TOKENS.DEGEN,
-                ethers.parseEther("100"), 
-                {
-                    gasLimit: 850000,
-                    maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas * 2n), 
-                    maxFeePerGas: feeData.maxFeePerGas,
-                    nonce: transactionNonce++,
-                    type: 2
-                }
-            );
+        // --- SIMULATION ---
+        try {
+            await flashContract.executeFlashArbitrage.staticCall(TOKENS.WETH, TOKENS.DEGEN, ethers.parseEther("100"));
+        } catch (err) { return; } 
 
-            console.log(`[🚀 STRIKE SENT] Tx: ${strike.hash}`);
-            const receipt = await strike.wait(1);
-            if (receipt.status === 1) {
-                totalEarnings += 12.50; 
-                console.log(`[💰 SUCCESS] Profit Captured!`);
+        // --- AGGRESSIVE BUNDLE ---
+        const feeData = await provider.getFeeData();
+        const strike = await flashContract.executeFlashArbitrage(
+            TOKENS.WETH,
+            TOKENS.DEGEN,
+            ethers.parseEther("100"), 
+            {
+                gasLimit: 850000,
+                // FIX: 3x Priority to win block space
+                maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas * 3n), 
+                maxFeePerGas: (feeData.maxFeePerGas * 2n),
+                nonce: transactionNonce++,
+                type: 2
             }
-        }
+        );
+
+        console.log(`[🚀 STRIKE SENT] Tx: ${strike.hash}`);
+        const receipt = await strike.wait(1);
+        if (receipt.status === 1) console.log(`[💰 SUCCESS] Profit Captured!`);
+
     } catch (e) {
-        if (e.message.includes("nonce")) transactionNonce = await provider.getTransactionCount(signer.address, 'latest');
+        if (e.message.includes("nonce") || e.message.includes("replacement")) {
+            transactionNonce = await provider.getTransactionCount(signer.address, 'pending');
+        }
     }
 }
 
-// 4. THE DARK FOREST SCANNER (WSS with Reconnect)
+// 4. THE DARK FOREST SCANNER (WSS with Heartbeat)
 function startScanning() {
-    console.log(`🔍 MEMPOOL SCANNER LIVE: ${WSS_URL.substring(0, 30)}...`);
+    console.log(`🔍 SCANNER LIVE: ${WSS_URL.substring(0, 30)}...`);
     const wssProvider = new ethers.WebSocketProvider(WSS_URL);
     
     wssProvider.on("pending", async (txHash) => {
         try {
             const tx = await provider.getTransaction(txHash);
             if (tx) executeApexStrike(tx);
-        } catch (e) { /* FallbackProvider handles retries */ }
+        } catch (e) { }
     });
 
-    // Auto-reconnect on WSS failure
+    // FIX: Ping-Pong Heartbeat to prevent silent drops on public nodes
+    const heartbeat = setInterval(() => {
+        if (wssProvider.websocket.readyState === 1) { // 1 = OPEN
+            wssProvider.websocket.ping();
+        }
+    }, 30000);
+
     wssProvider.websocket.on("close", () => {
+        clearInterval(heartbeat);
         console.log("🔄 WSS Drop. Reconnecting...");
         setTimeout(startScanning, 5000);
     });
 
+    // Logging Interval
     setInterval(() => {
         const idle = (Date.now() - lastLogTime) / 1000;
         console.log(`[SCAN] Active. Idle: ${idle.toFixed(0)}s | Nonce: ${transactionNonce}`);
@@ -143,7 +150,8 @@ app.get('/status', async (req, res) => {
             status: "HUNTING",
             wallet_eth: ethers.formatEther(bal),
             contract_weth: ethers.formatEther(contractBal),
-            rpcs_online: RPC_POOL.length
+            rpcs_online: RPC_POOL.length,
+            nonce: transactionNonce
         });
     } catch (e) { res.json({ status: "ERROR" }); }
 });
@@ -159,7 +167,7 @@ app.post('/withdraw', async (req, res) => {
 // 6. START
 init().then(() => {
     app.listen(PORT, () => {
-        console.log(`[SYSTEM] v12.5.1 API listening on ${PORT}`);
+        console.log(`[SYSTEM] v12.5.3 API listening on ${PORT}`);
         startScanning();
     });
 });
