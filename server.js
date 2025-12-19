@@ -1,5 +1,5 @@
 // ===============================================================================
-// APEX UNIFIED MASTER v12.7.5 (NITRO-HYBRID: HIGH-SPEED + PROFIT MONITOR)
+// APEX UNIFIED MASTER v12.8.0 (CLEAR-VIEW NITRO: SPEED + REAL LINKS)
 // ===============================================================================
 
 require('dotenv').config();
@@ -15,7 +15,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 8080;
 const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0";
-const PAYOUT_WALLET = process.env.PAYOUT_WALLET || "0xSET_YOUR_WALLET";
+const SCANNER_BASE = "https://basescan.org/tx/";
 
 const RPC_POOL = [
     process.env.QUICKNODE_HTTP,
@@ -41,11 +41,10 @@ let provider, signer, flashContract, transactionNonce;
 // 2. STABILIZED BOOT
 async function init() {
     console.log("-----------------------------------------");
-    console.log("⚡ NITRO-HYBRID BOOT: APEX v12.7.5");
+    console.log("💎 APEX v12.8.0: CLEAR-VIEW NITRO ONLINE");
     const network = ethers.Network.from(8453); 
 
     try {
-        // Fallback provider for stability
         const configs = RPC_POOL.map((url, i) => ({
             provider: new ethers.JsonRpcProvider(url, network, { staticNetwork: true }),
             priority: i === 0 ? 1 : 2,
@@ -61,8 +60,8 @@ async function init() {
         transactionNonce = await provider.getTransactionCount(signer.address, 'pending');
 
         console.log(`✅ [CONNECTED] Block: ${block}`);
-        console.log(`[WALLET] Gas ETH: ${ethers.formatEther(walletBal)}`);
-        console.log(`[TARGET] Minimum: 0.02 ETH`);
+        console.log(`[WALLET] Gas: ${ethers.formatEther(walletBal).substring(0, 7)} ETH`);
+        console.log(`[TARGET] Aggressive: 0.02 ETH`);
         console.log("-----------------------------------------");
     } catch (e) {
         console.error(`❌ [BOOT ERROR] ${e.message}`);
@@ -70,65 +69,69 @@ async function init() {
     }
 }
 
-// 3. NITRO STRIKE ENGINE (Fire-and-Forget + 0.02 ETH)
+// 3. CLEAR-VIEW NITRO ENGINE
 function executeApexStrike(targetTx) {
-    // 0.02 ETH Aggressive Threshold
     if (!targetTx || !targetTx.value || targetTx.value < ethers.parseEther("0.02")) return;
 
     const startTime = Date.now();
-    
-    // ASYNC FIRE: We do not 'await' here to keep the loop moving at 100% speed
+    const whaleVal = ethers.formatEther(targetTx.value).substring(0, 6);
+
+    // FIRE-AND-FORGET
     flashContract.executeFlashArbitrage(
         TOKENS.WETH, 
         TOKENS.DEGEN, 
         ethers.parseEther("100"), 
         {
             gasLimit: 850000,
-            // Nitro Bidding: Aggressive fixed-rate for instant broadcast
-            maxPriorityFeePerGas: ethers.parseUnits("0.12", "gwei"), 
-            maxFeePerGas: ethers.parseUnits("0.25", "gwei"),
+            maxPriorityFeePerGas: ethers.parseUnits("0.15", "gwei"), // High odds bid
+            maxFeePerGas: ethers.parseUnits("0.30", "gwei"),
             nonce: transactionNonce++,
             type: 2
         }
     ).then(tx => {
-        console.log(`[🚀 STRIKE SENT] Whale: ${ethers.formatEther(targetTx.value).substring(0,6)} ETH | Latency: ${Date.now() - startTime}ms`);
-        // Background confirmation
-        tx.wait(1).then(() => console.log(`[💰 CONFIRMED] Strike confirmed on-chain.`)).catch(() => {});
+        const latency = Date.now() - startTime;
+        console.log(`\n🚀 [STRIKE SENT] Whale: ${whaleVal} ETH | Latency: ${latency}ms`);
+        console.log(`🔗 [VIEW TX] ${SCANNER_BASE}${tx.hash}`);
+
+        // Track result in background
+        tx.wait(1).then(receipt => {
+            if (receipt.status === 1) {
+                console.log(`✅ [SUCCESS] Tx mined in block ${receipt.blockNumber}`);
+            } else {
+                console.log(`⚠️  [REVERT] Competition won the race.`);
+            }
+        }).catch(() => {});
+
     }).catch(err => {
-        // Background nonce resync if we collide
         if (err.message.includes("nonce")) {
             provider.getTransactionCount(signer.address, 'pending').then(n => transactionNonce = n);
         }
     });
 }
 
-// 4. SCANNER & HYBRID MONITOR
+// 4. SCANNER & MONITOR
 function startScanning() {
-    console.log(`🔍 SNIFFER ACTIVE: ${WSS_URL.substring(0, 30)}...`);
+    console.log(`🔍 SNIFFER LIVE: ${WSS_URL.substring(0, 30)}...`);
     const wssProvider = new ethers.WebSocketProvider(WSS_URL);
     
     wssProvider.on("pending", (h) => {
-        // Ultra-fast fetch
         provider.getTransaction(h).then(tx => {
             if (tx) executeApexStrike(tx);
         }).catch(() => {});
     });
 
-    // HEARTBEAT: Monitor Profits + Gas
     setInterval(async () => {
         try {
             const bal = await provider.getBalance(signer.address);
             const earnings = await flashContract.getContractBalance().catch(() => 0n);
-            console.log(`[HEARTBEAT] Gas: ${ethers.formatEther(bal).substring(0,6)} ETH | Earned: ${ethers.formatEther(earnings)} WETH | Nonce: ${transactionNonce}`);
-        } catch (e) {
-            console.log(`[HEARTBEAT] Syncing... Nonce: ${transactionNonce}`);
-        }
+            console.log(`[HEARTBEAT] Gas: ${ethers.formatEther(bal).substring(0,6)} | Earned: ${ethers.formatEther(earnings)} | Nonce: ${transactionNonce}`);
+        } catch (e) {}
     }, 45000);
 
     wssProvider.websocket.on("close", () => setTimeout(startScanning, 2000));
 }
 
-// 5. WITHDRAWAL STRATEGIES API
+// 5. WITHDRAWAL & STATUS
 app.post(`/withdraw/standard-eoa`, async (req, res) => {
     try {
         const tx = await flashContract.withdraw({ nonce: transactionNonce++ });
@@ -140,17 +143,9 @@ app.post(`/withdraw/standard-eoa`, async (req, res) => {
 app.get('/status', async (req, res) => {
     const bal = await provider.getBalance(signer.address).catch(() => 0n);
     const earnings = await flashContract.getContractBalance().catch(() => 0n);
-    res.json({ 
-        status: "HUNTING", 
-        gas: ethers.formatEther(bal), 
-        earned: ethers.formatEther(earnings) 
-    });
+    res.json({ status: "HUNTING", gas: ethers.formatEther(bal), earned: ethers.formatEther(earnings) });
 });
 
-// 6. START
 init().then(() => {
-    app.listen(PORT, () => {
-        console.log(`[SYSTEM] v12.7.5 Nitro-Hybrid Online`);
-        startScanning();
-    });
+    app.listen(PORT, () => startScanning());
 });
