@@ -1,5 +1,5 @@
 // ===============================================================================
-// APEX UNIFIED MASTER v12.5.3 (FAILOVER + WSS STABILIZED + PENDING NONCE)
+// APEX UNIFIED MASTER v12.5.5 (FAILOVER + LIVE BALANCE + FLASH STRIKE)
 // ===============================================================================
 
 require('dotenv').config();
@@ -27,8 +27,7 @@ const WSS_URL = process.env.QUICKNODE_WSS || "wss://base-rpc.publicnode.com";
 
 const TOKENS = {
     WETH: "0x4200000000000000000000000000000000000006",
-    DEGEN: "0x4edbc9ba171790664872997239bc7a3f3a633190",
-    VIRTUAL: "0x0b3e328455822223971382430b04e370d2367831" 
+    DEGEN: "0x4edbc9ba171790664872997239bc7a3f3a633190"
 };
 
 const ABI = [
@@ -40,9 +39,10 @@ const ABI = [
 let provider, signer, flashContract, transactionNonce;
 let lastLogTime = Date.now();
 
-// 2. HARDENED BOOT (With Fallback + Pending Nonce)
+// 2. HARDENED BOOT (With Fallback + Immediate Balance Audit)
 async function init() {
-    console.log("🛡️ BOOTING APEX SURVIVAL ENGINE...");
+    console.log("-----------------------------------------");
+    console.log("🛡️ BOOTING APEX UNIFIED v12.5.5...");
     const baseNetwork = ethers.Network.from(8453);
 
     const configs = RPC_POOL.map((url, i) => ({
@@ -56,33 +56,38 @@ async function init() {
     flashContract = new ethers.Contract(CONTRACT_ADDR, ABI, signer);
     
     try {
-        // FIX: Use 'pending' tag to include transactions currently in mempool
+        const walletBal = await provider.getBalance(signer.address);
+        const contractBal = await flashContract.getContractBalance();
         transactionNonce = await provider.getTransactionCount(signer.address, 'pending');
-        console.log(`✅ [BOOT] Online. Nonce: ${transactionNonce} | RPCs Active: ${RPC_POOL.length}`);
+
+        console.log(`✅ [BOOT] Online.`);
+        console.log(`[WALLET] Base ETH: ${ethers.formatEther(walletBal)} ETH`);
+        console.log(`[CONTRACT] WETH:  ${ethers.formatEther(contractBal)} WETH`);
+        console.log(`[NONCE]  Next ID: ${transactionNonce}`);
+        console.log(`📡 POOL: ${RPC_POOL.length} RPCs Active.`);
+        console.log("-----------------------------------------");
     } catch (e) {
         console.error("❌ [CRITICAL] All RPCs failed to respond.");
         process.exit(1);
     }
 }
 
-// 3. APEX EXECUTION (With Gas Guard & Aggressive Bidding)
+// 3. APEX EXECUTION (Flash Strike Logic)
 async function executeApexStrike(targetTx) {
     try {
         if (!targetTx || !targetTx.to || targetTx.value < ethers.parseEther("0.05")) return;
         
-        // GAS GUARD: Don't attempt if wallet is too low to pay gas
         const balance = await provider.getBalance(signer.address);
         if (balance < ethers.parseEther("0.0015")) return; 
 
         lastLogTime = Date.now();
         console.log(`[🎯 TARGET] Whale: ${ethers.formatEther(targetTx.value)} ETH.`);
 
-        // --- SIMULATION ---
+        // Simulation
         try {
             await flashContract.executeFlashArbitrage.staticCall(TOKENS.WETH, TOKENS.DEGEN, ethers.parseEther("100"));
         } catch (err) { return; } 
 
-        // --- AGGRESSIVE BUNDLE ---
         const feeData = await provider.getFeeData();
         const strike = await flashContract.executeFlashArbitrage(
             TOKENS.WETH,
@@ -90,7 +95,6 @@ async function executeApexStrike(targetTx) {
             ethers.parseEther("100"), 
             {
                 gasLimit: 850000,
-                // FIX: 3x Priority to win block space
                 maxPriorityFeePerGas: (feeData.maxPriorityFeePerGas * 3n), 
                 maxFeePerGas: (feeData.maxFeePerGas * 2n),
                 nonce: transactionNonce++,
@@ -109,7 +113,7 @@ async function executeApexStrike(targetTx) {
     }
 }
 
-// 4. THE DARK FOREST SCANNER (WSS with Heartbeat)
+// 4. SCANNER & HEARTBEAT MONITORING
 function startScanning() {
     console.log(`🔍 SCANNER LIVE: ${WSS_URL.substring(0, 30)}...`);
     const wssProvider = new ethers.WebSocketProvider(WSS_URL);
@@ -121,24 +125,27 @@ function startScanning() {
         } catch (e) { }
     });
 
-    // FIX: Ping-Pong Heartbeat to prevent silent drops on public nodes
-    const heartbeat = setInterval(() => {
-        if (wssProvider.websocket.readyState === 1) { // 1 = OPEN
-            wssProvider.websocket.ping();
-        }
+    // PING-PONG Heartbeat
+    const heartbeatPing = setInterval(() => {
+        if (wssProvider.websocket.readyState === 1) wssProvider.websocket.ping();
     }, 30000);
 
+    // --- RECURRING LOG HEARTBEAT (Every 60s) ---
+    setInterval(async () => {
+        try {
+            const bal = await provider.getBalance(signer.address);
+            const idle = (Date.now() - lastLogTime) / 1000;
+            console.log(`[SYNC] Wallet: ${ethers.formatEther(bal)} ETH | Idle: ${idle.toFixed(0)}s | Nonce: ${transactionNonce}`);
+        } catch (e) {
+            console.log(`[SYNC] RPC Lag - Waiting for next heartbeat...`);
+        }
+    }, 60000);
+
     wssProvider.websocket.on("close", () => {
-        clearInterval(heartbeat);
+        clearInterval(heartbeatPing);
         console.log("🔄 WSS Drop. Reconnecting...");
         setTimeout(startScanning, 5000);
     });
-
-    // Logging Interval
-    setInterval(() => {
-        const idle = (Date.now() - lastLogTime) / 1000;
-        console.log(`[SCAN] Active. Idle: ${idle.toFixed(0)}s | Nonce: ${transactionNonce}`);
-    }, 60000);
 }
 
 // 5. API ENDPOINTS
@@ -150,7 +157,7 @@ app.get('/status', async (req, res) => {
             status: "HUNTING",
             wallet_eth: ethers.formatEther(bal),
             contract_weth: ethers.formatEther(contractBal),
-            rpcs_online: RPC_POOL.length,
+            rpcs: RPC_POOL.length,
             nonce: transactionNonce
         });
     } catch (e) { res.json({ status: "ERROR" }); }
@@ -167,7 +174,7 @@ app.post('/withdraw', async (req, res) => {
 // 6. START
 init().then(() => {
     app.listen(PORT, () => {
-        console.log(`[SYSTEM] v12.5.3 API listening on ${PORT}`);
+        console.log(`[SYSTEM] v12.5.5 API online on Port ${PORT}`);
         startScanning();
     });
 });
