@@ -1,11 +1,12 @@
 // ===============================================================================
-// APEX UNIFIED MASTER v12.8.6 (CLEAR-VIEW NITRO + BIG-FISH EVOLUTION)
+// APEX UNIFIED MASTER v12.9.0 (NITRO-PROFIT + BIG-FISH EVOLUTION)
 // ===============================================================================
 
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { ethers } = require('ethers');
+const WebSocket = require('ws'); // For raw speed bypass
 
 const app = express();
 app.use(cors());
@@ -17,9 +18,11 @@ const PRIVATE_KEY = process.env.TREASURY_PRIVATE_KEY;
 const CONTRACT_ADDR = "0x83EF5c401fAa5B9674BAfAcFb089b30bAc67C9A0";
 const SCANNER_BASE = "https://basescan.org/tx/";
 
-// --- NITRO PROFIT SLIDERS ---
-const MIN_WHALE_SIZE = "0.5";       // Increased to 0.5 ETH to ensure profit covers gas
-const CRITICAL_GAS_LIMIT = "0.001"; // Safety shutoff to prevent wallet drain
+// --- NITRO PROFIT MATH ---
+const MIN_WHALE_SIZE = "1.0";       // MATH FIX: Only strike > 1 ETH for guaranteed slippage
+const CRITICAL_GAS_LIMIT = "0.001"; // Safety shutoff
+const BASE_FLASH_LOAN = "250";      // Starting attack size
+const MAX_FLASH_LOAN = "1200";      // Scale up for mega-whales
 // ----------------------------
 
 const RPC_POOL = [
@@ -37,22 +40,20 @@ const TOKENS = {
 
 const ABI = [
     "function executeFlashArbitrage(address tokenA, address tokenOut, uint256 amount) external",
-    "function getContractBalance() external view returns (uint256)",
     "function withdraw() external",
-    "function balanceOf(address account) external view returns (uint256)" // Added for WETH tracking
+    "function balanceOf(address account) external view returns (uint256)"
 ];
 
 let provider, signer, flashContract, transactionNonce, currentGasBalance;
 
-// 2. STABILIZED BOOT (FIXED BATCHING ERRORS)
+// 2. STABILIZED BOOT (FIXED BATCHING + FAILOVER)
 async function init() {
     console.log("-----------------------------------------");
-    console.log("💎 APEX v12.8.6: NITRO BIG-FISH ACTIVE");
-    const network = ethers.Network.from(8453); // Base Mainnet
+    console.log("🚀 APEX v12.9.0: NITRO-PROFIT ACTIVE");
+    const network = ethers.Network.from(8453); 
 
     try {
         const configs = RPC_POOL.map((url, i) => ({
-            // batchMaxCount: 1 stops the "maximum 10 calls in 1 batch" error
             provider: new ethers.JsonRpcProvider(url, network, { 
                 staticNetwork: true,
                 batchMaxCount: 1 
@@ -65,13 +66,11 @@ async function init() {
         signer = new ethers.Wallet(PRIVATE_KEY, provider);
         flashContract = new ethers.Contract(CONTRACT_ADDR, ABI, signer);
         
-        const block = await provider.getBlockNumber();
         currentGasBalance = await provider.getBalance(signer.address);
         transactionNonce = await provider.getTransactionCount(signer.address, 'pending');
 
-        console.log(`✅ [CONNECTED] Block: ${block}`);
-        console.log(`[WALLET] Gas: ${ethers.formatEther(currentGasBalance).substring(0, 7)} ETH`);
-        console.log(`🎯 [TARGET] Min Whale: ${MIN_WHALE_SIZE} ETH`);
+        console.log(`✅ [CONNECTED] Gas: ${ethers.formatEther(currentGasBalance).substring(0, 7)} ETH`);
+        console.log(`🎯 [TARGET] Whale: >1.0 ETH | Dynamic Loan: 250-1200 WETH`);
         console.log("-----------------------------------------");
     } catch (e) {
         console.error(`❌ [BOOT ERROR] ${e.message}`);
@@ -79,84 +78,93 @@ async function init() {
     }
 }
 
-// 3. NITRO STRIKE ENGINE
-function executeApexStrike(targetTx) {
-    // WHALE FILTER: Skip small bait to save gas
-    if (!targetTx || !targetTx.value || targetTx.value < ethers.parseEther(MIN_WHALE_SIZE)) return;
+// 3. NITRO STRIKE ENGINE (DYNAMIC MATH + SPEED)
+async function executeApexStrike(txHash) {
+    try {
+        const targetTx = await provider.getTransaction(txHash);
+        
+        // A. PROFIT FILTER: Only swing at > 1 ETH whales
+        if (!targetTx || !targetTx.value || targetTx.value < ethers.parseEther(MIN_WHALE_SIZE)) return;
+        if (currentGasBalance < ethers.parseEther(CRITICAL_GAS_LIMIT)) return;
 
-    // GAS SAFEGUARD: Protect your remaining operational funds
-    if (currentGasBalance < ethers.parseEther(CRITICAL_GAS_LIMIT)) {
-        console.log("🛑 [SYSTEM PAUSED] Gas below critical limit. Refill required.");
-        return;
-    }
+        const startTime = Date.now();
+        const whaleVal = parseFloat(ethers.formatEther(targetTx.value));
+        
+        // B. MATH FIX: Scale attack based on whale size
+        let loanAmount = BASE_FLASH_LOAN; 
+        if (whaleVal > 3.0) loanAmount = "600"; 
+        if (whaleVal > 10.0) loanAmount = MAX_FLASH_LOAN;
 
-    const startTime = Date.now();
-    const whaleVal = ethers.formatEther(targetTx.value).substring(0, 6);
-
-    // FIRE-AND-FORGET EXECUTION
-    flashContract.executeFlashArbitrage(
-        TOKENS.WETH, 
-        TOKENS.DEGEN, 
-        ethers.parseEther("100"), 
-        {
-            gasLimit: 800000,
-            maxPriorityFeePerGas: ethers.parseUnits("0.1", "gwei"),
-            maxFeePerGas: ethers.parseUnits("0.2", "gwei"),
-            nonce: transactionNonce++,
-            type: 2
-        }
-    ).then(tx => {
-        const latency = Date.now() - startTime;
-        console.log(`\n🚀 [BIG FISH STRIKE] Whale: ${whaleVal} ETH | Latency: ${latency}ms`);
-        console.log(`🔗 [VIEW TX] ${SCANNER_BASE}${tx.hash}`);
-
-        tx.wait(1).then(receipt => {
-            if (receipt.status === 1) {
-                console.log(`✅ [SUCCESS] Tx mined in block ${receipt.blockNumber}`);
-            } else {
-                console.log(`⚠️  [REVERT] Profit not found - Transaction protected.`);
+        // C. NITRO SPEED: High-Priority Gas Bid
+        flashContract.executeFlashArbitrage(
+            TOKENS.WETH, 
+            TOKENS.DEGEN, 
+            ethers.parseEther(loanAmount.toString()), 
+            {
+                gasLimit: 850000,
+                maxPriorityFeePerGas: ethers.parseUnits("0.25", "gwei"), // Nitro cut-in-line
+                maxFeePerGas: ethers.parseUnits("0.50", "gwei"),
+                nonce: transactionNonce++,
+                type: 2
             }
-        }).catch(() => {});
+        ).then(tx => {
+            const latency = Date.now() - startTime;
+            console.log(`\n💰 [PROFIT STRIKE] Whale: ${whaleVal.toFixed(2)} ETH | Loan: ${loanAmount} WETH | Latency: ${latency}ms`);
+            console.log(`🔗 [VIEW TX] ${SCANNER_BASE}${tx.hash}`);
 
-    }).catch(err => {
-        if (err.message.includes("nonce")) {
-            provider.getTransactionCount(signer.address, 'pending').then(n => transactionNonce = n);
-        }
-    });
+            tx.wait(1).then(receipt => {
+                if (receipt.status === 1) console.log(`✅ [SUCCESS] Mined in block ${receipt.blockNumber}`);
+                else console.log(`⚠️  [REVERT] No profit gap found.`);
+            }).catch(() => {});
+
+        }).catch(err => {
+            if (err.message.includes("nonce")) {
+                provider.getTransactionCount(signer.address, 'pending').then(n => transactionNonce = n);
+            }
+        });
+    } catch (e) {}
 }
 
-// 4. SCANNER & WETH MONITOR
-function startScanning() {
-    console.log(`🔍 SNIFFER LIVE: ${WSS_URL.substring(0, 30)}...`);
-    const wssProvider = new ethers.WebSocketProvider(WSS_URL);
+// 4. NITRO SCANNER (RAW WEBSOCKET SPEED)
+function startNitroScanner() {
+    console.log(`🔍 SNIFFER LIVE: RAW WEBSOCKET MODE`);
+    const ws = new WebSocket(WSS_URL);
     const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
-    
-    wssProvider.on("pending", (h) => {
-        provider.getTransaction(h).then(tx => {
-            if (tx) executeApexStrike(tx);
-        }).catch(() => {});
+
+    ws.on('open', () => {
+        ws.send(JSON.stringify({ "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": ["newPendingTransactions"] }));
     });
 
+    ws.on('message', (data) => {
+        const response = JSON.parse(data);
+        if (response.params && response.params.result) {
+            executeApexStrike(response.params.result);
+        }
+    });
+
+    // HEARTBEAT MONITOR
     setInterval(async () => {
         try {
             currentGasBalance = await provider.getBalance(signer.address);
-            
-            // Checks specifically for WETH profit in the contract
             const wethBal = await wethContract.balanceOf(CONTRACT_ADDR).catch(() => 0n);
-            
-            console.log(`[HEARTBEAT] Gas: ${ethers.formatEther(currentGasBalance).substring(0,6)} | Earned (WETH): ${ethers.formatEther(wethBal).substring(0,7)} | Nonce: ${transactionNonce}`);
-        } catch (e) {
-            console.log("⚠️ RPC Heartbeat lag... still hunting.");
-        }
+            console.log(`[HB] Gas: ${ethers.formatEther(currentGasBalance).substring(0,6)} | Earned (WETH): ${ethers.formatEther(wethBal).substring(0,7)} | Nonce: ${transactionNonce}`);
+        } catch (e) {}
     }, 45000);
 
-    wssProvider.websocket.on("close", () => {
-        console.log("🔄 Reconnecting Sniffer...");
-        setTimeout(startScanning, 2000);
+    ws.on("close", () => {
+        console.log("🔄 Reconnecting Nitro Sniffer...");
+        setTimeout(startNitroScanner, 2000);
     });
 }
 
-// 5. WITHDRAWAL & STATUS
+// 5. STATUS & WITHDRAWAL
+app.get('/status', async (req, res) => {
+    const bal = await provider.getBalance(signer.address).catch(() => 0n);
+    const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
+    const wethBal = await wethContract.balanceOf(CONTRACT_ADDR).catch(() => 0n);
+    res.json({ status: "NITRO_HUNTING", gas: ethers.formatEther(bal), earned_weth: ethers.formatEther(wethBal) });
+});
+
 app.post(`/withdraw/standard-eoa`, async (req, res) => {
     try {
         const tx = await flashContract.withdraw({ nonce: transactionNonce++ });
@@ -165,19 +173,6 @@ app.post(`/withdraw/standard-eoa`, async (req, res) => {
     } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/status', async (req, res) => {
-    try {
-        const bal = await provider.getBalance(signer.address);
-        const wethContract = new ethers.Contract(TOKENS.WETH, ABI, provider);
-        const wethBal = await wethContract.balanceOf(CONTRACT_ADDR);
-        res.json({ 
-            status: "HUNTING", 
-            gas_eth: ethers.formatEther(bal), 
-            contract_weth: ethers.formatEther(wethBal) 
-        });
-    } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 init().then(() => {
-    app.listen(PORT, () => startScanning());
+    app.listen(PORT, () => startNitroScanner());
 });
